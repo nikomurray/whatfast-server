@@ -58,7 +58,7 @@ class WhatsAppServer {
       });
 
       socket.on("disconnect", () => {
-        // console.log(`Usuario desconectado: ${socket.id}`);
+        console.log(`Usuario desconectado: ${socket.id}`);
         this.io.to(socket.id).emit("login", false);
         this.destroyWhatsAppClient(socket.id);
       });
@@ -84,9 +84,17 @@ class WhatsAppServer {
         printQRInTerminal: false,
         browser: ['WhatsApp Server', 'Chrome', '120.0.0'],
         logger: pino({ level: 'silent' }),
-        markOnlineOnConnect: true,
+        markOnlineOnConnect: false, // Cambiado a false para evitar problemas
         generateHighQualityLinkPreview: false,
         syncFullHistory: false,
+        getMessage: async (key) => {
+          return { conversation: '' }; // Manejar mensajes requeridos
+        },
+        // Añadir configuraciones para mejorar estabilidad
+        connectTimeoutMs: 60000,
+        defaultQueryTimeoutMs: 60000,
+        keepAliveIntervalMs: 10000,
+        retryRequestDelayMs: 250,
       });
 
       this.clients.set(socketId, {
@@ -99,6 +107,7 @@ class WhatsAppServer {
         ready: false,
         isDestroying: false,
         saveCreds,
+        connectionState: 'disconnected', // Añadir estado de conexión
       });
 
       // Configurar event handlers
@@ -118,7 +127,10 @@ class WhatsAppServer {
     // Handle WebSocket errors
     sock.ws?.on('error', (error) => {
       console.error(`WebSocket error for ${socketId}:`, error);
-      // Don't emit error events here, let the connection.update handler deal with it
+      // Marcar conexión como perdida
+      if (clientData) {
+        clientData.connectionState = 'error';
+      }
     });
 
     // Manejar actualizaciones de conexión
@@ -130,23 +142,32 @@ class WhatsAppServer {
       }
 
       if (connection === 'close') {
+        clientData.connectionState = 'closed';
+        
         const shouldReconnect = (lastDisconnect?.error instanceof Boom)
           ? lastDisconnect.error.output?.statusCode !== DisconnectReason.loggedOut
           : true;
 
-        console.log(`Conexión cerrada para ${socketId}, ¿reconectar?`, shouldReconnect);
+        console.log(`Conexión cerrada para ${socketId}, ¿reconectar?`, shouldReconnect, 
+                   lastDisconnect?.error?.output?.statusCode);
 
         if (shouldReconnect && !clientData.isDestroying) {
+          // Limpiar el cliente actual antes de reconectar
+          await this.cleanupClient(socketId, false);
+          
           setTimeout(() => {
             if (this.io.sockets.sockets.has(socketId) && !clientData.isDestroying) {
               this.initializeWhatsAppClient(socketId);
             }
-          }, 2000);
+          }, 3000); // Aumentar tiempo de reconexión
         } else {
           this.handleClientDisconnect(socketId, 'LOGOUT');
         }
       } else if (connection === 'open') {
+        clientData.connectionState = 'open';
         this.handleClientReady(socketId);
+      } else if (connection === 'connecting') {
+        clientData.connectionState = 'connecting';
       }
     });
 
@@ -161,7 +182,53 @@ class WhatsAppServer {
     // Handle socket errors to prevent unhandled error events
     sock.ev.on('error', (error) => {
       console.error(`Baileys socket error for ${socketId}:`, error);
+      if (clientData) {
+        clientData.connectionState = 'error';
+      }
     });
+  }
+
+  async cleanupClient(socketId, removeFromMap = true) {
+    const clientData = this.clients.get(socketId);
+    if (!clientData) return;
+
+    try {
+      // Clear any pending QR timeout
+      if (clientData.qrTimeout) {
+        clearTimeout(clientData.qrTimeout);
+        clientData.qrTimeout = null;
+      }
+
+      // Stop sending messages if in progress
+      clientData.stopSendingMessages = true;
+
+      // Cerrar WebSocket directamente si existe
+      if (clientData.sock?.ws) {
+        try {
+          if (clientData.sock.ws.readyState === clientData.sock.ws.OPEN) {
+            clientData.sock.ws.close();
+          }
+        } catch (wsError) {
+          console.error(`Error cerrando websocket para ${socketId}:`, wsError);
+        }
+      }
+
+      // Limpiar event listeners
+      if (clientData.sock?.ev) {
+        try {
+          clientData.sock.ev.removeAllListeners();
+        } catch (error) {
+          console.error(`Error removiendo listeners para ${socketId}:`, error);
+        }
+      }
+
+    } catch (error) {
+      console.error(`Error en cleanup del cliente ${socketId}:`, error);
+    }
+
+    if (removeFromMap) {
+      this.clients.delete(socketId);
+    }
   }
 
   async destroyWhatsAppClient(socketId) {
@@ -171,42 +238,28 @@ class WhatsAppServer {
       this.io.to(socketId).emit("login", false);
 
       try {
-        // Clear any pending QR timeout
-        if (clientData.qrTimeout) {
-          clearTimeout(clientData.qrTimeout);
-        }
-
-        // Stop sending messages if in progress
-        clientData.stopSendingMessages = true;
-
-        // Give the client time to finish any pending operations
-        await new Promise(resolve => setTimeout(resolve, 500));
-
-        // Cerrar conexión de Baileys
-        if (clientData.sock) {
+        // Solo intentar logout si la conexión está activa
+        if (clientData.sock && clientData.connectionState === 'open') {
           try {
-            // Check if the socket is still connected before attempting logout
+            // Verificar estado del WebSocket antes de logout
             if (clientData.sock.ws && clientData.sock.ws.readyState === clientData.sock.ws.OPEN) {
-              await clientData.sock.logout();
+              await Promise.race([
+                clientData.sock.logout(),
+                new Promise((_, reject) => setTimeout(() => reject(new Error('Logout timeout')), 3000))
+              ]);
             } else {
-              // If WebSocket is not open, just close it directly
-              console.log(`WebSocket for ${socketId} is not open, skipping logout`);
-              if (clientData.sock.ws && clientData.sock.ws.readyState !== clientData.sock.ws.CLOSED) {
-                clientData.sock.ws.close();
-              }
+              console.log(`WebSocket para ${socketId} no está abierto, omitiendo logout`);
             }
           } catch (logoutError) {
-            console.error(`Error durante logout del cliente ${socketId}:`, logoutError);
-            // Intentar cerrar la conexión websocket directamente
-            try {
-              if (clientData.sock.ws && clientData.sock.ws.readyState !== clientData.sock.ws.CLOSED) {
-                clientData.sock.ws.close();
-              }
-            } catch (wsError) {
-              console.error(`Error cerrando websocket para ${socketId}:`, wsError);
-            }
+            console.error(`Error durante logout del cliente ${socketId}:`, logoutError.message);
+            // No relanzar el error, solo loggearlo
           }
+        } else {
+          console.log(`Cliente ${socketId} no está conectado, omitiendo logout`);
         }
+
+        // Limpiar cliente
+        await this.cleanupClient(socketId, false);
 
       } catch (error) {
         console.error(`Error al destruir cliente ${socketId}:`, error);
@@ -259,13 +312,15 @@ class WhatsAppServer {
 
       // Only reinitialize if the socket is still connected and not a logout
       if (this.io.sockets.sockets.has(socketId) && reason !== 'LOGOUT') {
-        await this.destroyWhatsAppClient(socketId);
+        await this.cleanupClient(socketId, false);
         // Small delay before reinitializing
         setTimeout(() => {
           if (this.io.sockets.sockets.has(socketId)) {
             this.initializeWhatsAppClient(socketId);
           }
-        }, 2000);
+        }, 3000);
+      } else {
+        await this.cleanupClient(socketId, true);
       }
     }
   }
@@ -305,8 +360,10 @@ class WhatsAppServer {
       processedCount++;
       console.log(`Procesando número ${processedCount}/${numbers.length}: ${number}`);
 
-      if (clientData.stopSendingMessages || clientData.isDestroying) {
-        console.log(`Detención de envío de mensajes para ${socketId}.`);
+      // Verificar estado del cliente antes de cada envío
+      if (clientData.stopSendingMessages || clientData.isDestroying || 
+          clientData.connectionState !== 'open') {
+        console.log(`Detención de envío de mensajes para ${socketId}. Estado: ${clientData.connectionState}`);
         break;
       }
 
@@ -320,26 +377,28 @@ class WhatsAppServer {
         await this.sendSingleMessage(clientData.sock, number, message);
         console.log(`✅ Mensaje enviado a ${number} por ${socketId}`);
         this.sendMessageReport(socket, number, true);
+        
+        // Verificar estado después del envío
+        if (clientData.connectionState !== 'open') {
+          console.log(`⚠️ Conexión perdida después de enviar a ${number}`);
+          break;
+        }
+        
       } catch (error) {
         console.error(`❌ Error al enviar mensaje a ${number} por ${socketId}: ${error.message}`);
         this.sendMessageReport(socket, number, false);
 
-        if (
-          error.message.includes("Target closed") ||
-          error.message.includes("Protocol error") ||
-          error.message.includes("Conexión perdida") ||
-          error.message.includes("Connection Closed") ||
-          error.message.includes("WebSocket")
-        ) {
-          console.error(`🛑 Cliente WhatsApp desconectado. Abortando envío para ${socketId}`);
+        // Verificar si es un error crítico de conexión
+        if (this.isCriticalConnectionError(error)) {
+          console.error(`🛑 Error crítico de conexión. Abortando envío para ${socketId}`);
           socket.emit("error", "WhatsApp se desconectó. Por favor recarga la página.");
           wasAbortedPorErrorCritico = true;
           break;
         }
       }
 
-      // Solo esperar si no es el último número
-      if (processedCount < numbers.length) {
+      // Solo esperar si no es el último número y la conexión sigue activa
+      if (processedCount < numbers.length && clientData.connectionState === 'open') {
         await new Promise((resolve) => setTimeout(resolve, interval * 1000));
       }
     }
@@ -352,6 +411,23 @@ class WhatsAppServer {
     if (clientData) {
       clientData.stopSendingMessages = false;
     }
+  }
+
+  isCriticalConnectionError(error) {
+    const criticalErrors = [
+      "Target closed",
+      "Protocol error",
+      "Conexión perdida",
+      "Connection Closed",
+      "WebSocket",
+      "Connection terminated",
+      "Socket is closed",
+      "Rate limit exceeded"
+    ];
+    
+    return criticalErrors.some(criticalError => 
+      error.message.includes(criticalError)
+    );
   }
 
   async sendSingleMessage(sock, number, message) {
@@ -385,20 +461,32 @@ class WhatsAppServer {
 
       const jid = `${formattedNumber}@s.whatsapp.net`;
 
-      // Verificar que el número esté registrado en WhatsApp
-      const [result] = await sock.onWhatsApp(formattedNumber);
+      // Verificar que el número esté registrado en WhatsApp con timeout
+      const onWhatsAppResult = await Promise.race([
+        sock.onWhatsApp(formattedNumber),
+        new Promise((_, reject) => 
+          setTimeout(() => reject(new Error('Timeout verificando número')), 10000)
+        )
+      ]);
+
+      const [result] = onWhatsAppResult;
 
       if (!result || !result.exists) {
         throw new Error(`El número ${number} no está registrado en WhatsApp`);
       }
 
-      // Enviar el mensaje con reintentos
+      // Enviar el mensaje con reintentos y timeout
       let attempts = 0;
-      const maxAttempts = 3;
+      const maxAttempts = 2; // Reducir intentos para evitar problemas
 
       while (attempts < maxAttempts) {
         try {
-          const sentMsg = await sock.sendMessage(jid, { text: message });
+          const sentMsg = await Promise.race([
+            sock.sendMessage(jid, { text: message }),
+            new Promise((_, reject) => 
+              setTimeout(() => reject(new Error('Timeout enviando mensaje')), 15000)
+            )
+          ]);
           return sentMsg;
         } catch (sendError) {
           attempts++;
@@ -408,7 +496,7 @@ class WhatsAppServer {
           }
 
           // Esperar antes del siguiente intento
-          await new Promise(resolve => setTimeout(resolve, 2000));
+          await new Promise(resolve => setTimeout(resolve, 1000));
         }
       }
 
@@ -418,6 +506,8 @@ class WhatsAppServer {
         throw new Error(`Conexión perdida con WhatsApp`);
       } else if (error.message.includes('rate-overlimit')) {
         throw new Error(`Límite de tasa excedido. Espera un momento antes de continuar.`);
+      } else if (error.message.includes('Timeout')) {
+        throw new Error(`Timeout al procesar número ${number}`);
       }
 
       throw new Error(`Error enviando mensaje: ${error.message}`);
@@ -459,9 +549,12 @@ class WhatsAppServer {
       console.log('Cerrando servidor...');
 
       // Destroy all clients
-      for (const [socketId, clientData] of this.clients) {
-        await this.destroyWhatsAppClient(socketId);
+      const clientPromises = [];
+      for (const [socketId] of this.clients) {
+        clientPromises.push(this.destroyWhatsAppClient(socketId));
       }
+      
+      await Promise.allSettled(clientPromises);
 
       this.server.close(() => {
         console.log('Servidor cerrado');
