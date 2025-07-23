@@ -108,6 +108,10 @@ class WhatsAppServer {
         isDestroying: false,
         saveCreds,
         connectionState: 'disconnected', // Añadir estado de conexión
+        isSendingMessages: false, // Flag para saber si está enviando
+        reconnecting: false, // Flag para reconexión
+        messageQueue: [], // Cola de mensajes pendientes
+        currentMessageIndex: 0, // Índice actual en el envío
       });
 
       // Configurar event handlers
@@ -151,7 +155,22 @@ class WhatsAppServer {
         console.log(`Conexión cerrada para ${socketId}, ¿reconectar?`, shouldReconnect, 
                    lastDisconnect?.error?.output?.statusCode);
 
-        if (shouldReconnect && !clientData.isDestroying) {
+        // Si estamos enviando mensajes, pausar y intentar reconectar
+        if (clientData.isSendingMessages && shouldReconnect && !clientData.isDestroying) {
+          console.log(`🔄 Reconectando durante envío de mensajes para ${socketId}...`);
+          clientData.ready = false;
+          clientData.reconnecting = true;
+          
+          // Limpiar el cliente actual antes de reconectar
+          await this.cleanupClient(socketId, false);
+          
+          // Reconectar más rápido durante envío
+          setTimeout(async () => {
+            if (this.io.sockets.sockets.has(socketId) && !clientData.isDestroying) {
+              await this.initializeWhatsAppClient(socketId);
+            }
+          }, 1500);
+        } else if (shouldReconnect && !clientData.isDestroying) {
           // Limpiar el cliente actual antes de reconectar
           await this.cleanupClient(socketId, false);
           
@@ -159,12 +178,19 @@ class WhatsAppServer {
             if (this.io.sockets.sockets.has(socketId) && !clientData.isDestroying) {
               this.initializeWhatsAppClient(socketId);
             }
-          }, 3000); // Aumentar tiempo de reconexión
+          }, 3000);
         } else {
           this.handleClientDisconnect(socketId, 'LOGOUT');
         }
       } else if (connection === 'open') {
         clientData.connectionState = 'open';
+        
+        // Si estábamos reconectando durante envío, reanudar
+        if (clientData.reconnecting) {
+          console.log(`✅ Reconexión exitosa para ${socketId}, reanudando envío...`);
+          clientData.reconnecting = false;
+        }
+        
         this.handleClientReady(socketId);
       } else if (connection === 'connecting') {
         clientData.connectionState = 'connecting';
@@ -353,23 +379,64 @@ class WhatsAppServer {
     console.log(`Iniciando envío de mensajes para ${socketId} con intervalo de ${interval} segundos...`);
     console.log(`Total de números a procesar: ${numbers.length}`);
 
+    // Configurar estado de envío
+    clientData.isSendingMessages = true;
+    clientData.messageQueue = numbers;
+    clientData.currentMessageIndex = 0;
+    clientData.stopSendingMessages = false;
+
     let wasAbortedPorErrorCritico = false;
-    let processedCount = 0;
+    
+    try {
+      await this.processMessageQueue(socket, message, interval);
+    } catch (error) {
+      console.error(`Error en el proceso de envío para ${socketId}:`, error);
+      wasAbortedPorErrorCritico = true;
+      socket.emit("error", "Error durante el envío de mensajes");
+    }
 
-    for (const number of numbers) {
-      processedCount++;
-      console.log(`Procesando número ${processedCount}/${numbers.length}: ${number}`);
+    // Limpiar estado de envío
+    if (clientData) {
+      clientData.isSendingMessages = false;
+      clientData.stopSendingMessages = false;
+      clientData.messageQueue = [];
+      clientData.currentMessageIndex = 0;
+    }
 
-      // Verificar estado del cliente antes de cada envío
-      if (clientData.stopSendingMessages || clientData.isDestroying || 
-          clientData.connectionState !== 'open') {
-        console.log(`Detención de envío de mensajes para ${socketId}. Estado: ${clientData.connectionState}`);
+    if (!wasAbortedPorErrorCritico) {
+      console.log(`📬 Finalizado envío de mensajes para ${socketId}.`);
+      socket.emit("finish");
+    }
+  }
+
+  async processMessageQueue(socket, message, interval) {
+    const socketId = socket.id;
+    const clientData = this.clients.get(socketId);
+
+    while (clientData.currentMessageIndex < clientData.messageQueue.length) {
+      // Verificar si se debe detener
+      if (clientData.stopSendingMessages || clientData.isDestroying) {
+        console.log(`Detención solicitada para ${socketId}`);
         break;
+      }
+
+      const number = clientData.messageQueue[clientData.currentMessageIndex];
+      const currentIndex = clientData.currentMessageIndex + 1;
+      const total = clientData.messageQueue.length;
+
+      console.log(`Procesando número ${currentIndex}/${total}: ${number}`);
+
+      // Esperar a que la conexión esté lista
+      if (!await this.waitForConnection(socketId, 30000)) {
+        console.error(`❌ Timeout esperando conexión para ${socketId}`);
+        socket.emit("error", "Timeout de conexión. Por favor recarga la página.");
+        throw new Error("Connection timeout");
       }
 
       if (!this.isValidNumber(number)) {
         console.warn(`Número inválido omitido: ${number}`);
         this.sendMessageReport(socket, number, false);
+        clientData.currentMessageIndex++;
         continue;
       }
 
@@ -378,53 +445,75 @@ class WhatsAppServer {
         console.log(`✅ Mensaje enviado a ${number} por ${socketId}`);
         this.sendMessageReport(socket, number, true);
         
-        // Verificar estado después del envío
-        if (clientData.connectionState !== 'open') {
-          console.log(`⚠️ Conexión perdida después de enviar a ${number}`);
-          break;
-        }
-        
       } catch (error) {
         console.error(`❌ Error al enviar mensaje a ${number} por ${socketId}: ${error.message}`);
         this.sendMessageReport(socket, number, false);
 
-        // Verificar si es un error crítico de conexión
+        // Si es un error crítico, no continuar
         if (this.isCriticalConnectionError(error)) {
           console.error(`🛑 Error crítico de conexión. Abortando envío para ${socketId}`);
-          socket.emit("error", "WhatsApp se desconectó. Por favor recarga la página.");
-          wasAbortedPorErrorCritico = true;
-          break;
+          socket.emit("error", "Error crítico de conexión. Por favor recarga la página.");
+          throw error;
         }
       }
 
-      // Solo esperar si no es el último número y la conexión sigue activa
-      if (processedCount < numbers.length && clientData.connectionState === 'open') {
+      clientData.currentMessageIndex++;
+
+      // Esperar antes del siguiente mensaje si no es el último
+      if (clientData.currentMessageIndex < clientData.messageQueue.length) {
         await new Promise((resolve) => setTimeout(resolve, interval * 1000));
       }
     }
+  }
 
-    if (!wasAbortedPorErrorCritico) {
-      console.log(`📬 Finalizado envío de mensajes para ${socketId}. Procesados: ${processedCount}/${numbers.length}`);
-      socket.emit("finish");
+  async waitForConnection(socketId, timeoutMs = 30000) {
+    const clientData = this.clients.get(socketId);
+    if (!clientData) return false;
+
+    const startTime = Date.now();
+
+    while (Date.now() - startTime < timeoutMs) {
+      // Si está listo y conectado, continuar
+      if (clientData.ready && clientData.connectionState === 'open') {
+        return true;
+      }
+
+      // Si está reconectando, esperar
+      if (clientData.reconnecting || clientData.connectionState === 'connecting') {
+        console.log(`⏳ Esperando reconexión para ${socketId}...`);
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        continue;
+      }
+
+      // Si la conexión está cerrada y no está reconectando, hay un problema
+      if (clientData.connectionState === 'closed' && !clientData.reconnecting) {
+        console.log(`⚠️ Conexión cerrada sin reconexión para ${socketId}`);
+        return false;
+      }
+
+      // Si se debe detener, salir
+      if (clientData.stopSendingMessages || clientData.isDestroying) {
+        return false;
+      }
+
+      await new Promise(resolve => setTimeout(resolve, 500));
     }
 
-    if (clientData) {
-      clientData.stopSendingMessages = false;
-    }
+    return false;
   }
 
   isCriticalConnectionError(error) {
     const criticalErrors = [
       "Target closed",
-      "Protocol error",
-      "Conexión perdida",
-      "Connection Closed",
-      "WebSocket",
+      "Protocol error", 
       "Connection terminated",
       "Socket is closed",
-      "Rate limit exceeded"
+      "Rate limit exceeded",
+      "Connection timeout"
     ];
     
+    // No considerar "Conexión perdida", "Connection Closed", o "WebSocket" como críticos
+    // ya que podemos recuperarnos de estos con reconexión
     return criticalErrors.some(criticalError => 
       error.message.includes(criticalError)
     );
